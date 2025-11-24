@@ -1,0 +1,334 @@
+"""
+完整爬取抖音合集（含视频详情与评论），结构化落盘。
+输出结构：
+output/
+ ├─001/【视频标题】.csv   （含视频元信息 + 一级/二级评论）
+ ├─002/...
+同时在 output/mix_summary_*.csv 写全集合汇总。
+"""
+
+import argparse
+import asyncio
+import json
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Any
+
+from crawlers.douyin.web.web_crawler import DouyinWebCrawler
+
+# 让 stdout 行缓冲，避免“无响应”错觉
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+
+def sanitize_filename(name: str, max_len: int = 80) -> str:
+    """去除文件名非法字符，限制长度"""
+    invalid = '\\/:*?"<>|'
+    for ch in invalid:
+        name = name.replace(ch, "_")
+    name = name.strip().replace("\n", " ").replace("\r", " ")
+    return (name[:max_len] or "untitled").strip()
+
+
+class MixCrawler:
+    """合集爬虫（顺序爬取，带断点跳过已存在文件）"""
+
+    def __init__(self, output_dir: Path, max_comments: int, sleep: float):
+        self.crawler = DouyinWebCrawler()
+        self.output_dir = output_dir
+        self.output_dir.mkdir(exist_ok=True)
+        self.max_comments = max_comments
+        self.sleep = sleep
+
+    async def crawl_mix_complete(self, mix_id: str, crawl_comments: bool = True):
+        print(f"\n{'=' * 70}")
+        print(f"开始爬取合集: {mix_id}")
+        print(f"{'=' * 70}")
+
+        # 1) 拉全集合视频
+        print("\n【步骤1】获取合集所有视频...")
+        all_videos = await self.get_all_mix_videos(mix_id)
+        if not all_videos:
+            print("✗ 未获取到视频，可能 Cookie 失效或接口变更")
+            return
+        print(f"✓ 共获取 {len(all_videos)} 个视频")
+
+        # 2) 汇总 CSV
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary_file = self.output_dir / f"mix_{mix_id}_summary_{timestamp}.json"
+        summary_rows: List[Dict[str, Any]] = []
+
+        print("\n【步骤2】逐条落盘（含评论）...")
+        for idx, video in enumerate(all_videos, 1):
+            folder = self.output_dir / f"{idx:03d}"
+            folder.mkdir(exist_ok=True)
+
+            video_meta = self.extract_video_meta(idx, video)
+            file_name = sanitize_filename(video_meta["视频标题"]) + ".json"
+            file_path = folder / file_name
+
+            if file_path.exists():
+                print(f"  {idx:03d}/{len(all_videos)} 已存在，跳过：{file_name}")
+                summary_rows.append(video_meta)
+                continue
+
+            # 评论（可选）
+            comments: List[Dict[str, Any]] = []
+            if crawl_comments and video_meta["评论总数"] > 0:
+                comments = await self.get_all_comments(
+                    aweme_id=video_meta["视频ID"],
+                    video_title=video_meta["视频标题"],
+                    expect_count=video_meta["评论总数"],
+                )
+
+            rows = self.merge_video_and_comments(video_meta, comments)
+            self.save_json(file_path, rows)
+            summary_rows.append(video_meta)
+
+            try:
+                rel_path = file_path.relative_to(self.output_dir)
+            except Exception:
+                rel_path = file_path.name
+            print(f"  ✓ 已完成 {idx:03d}/{len(all_videos)} -> {rel_path}")
+            await asyncio.sleep(self.sleep)
+
+        # 写汇总
+        self.save_json(summary_file, summary_rows)
+        print(f"\n{'=' * 70}")
+        print("爬取完成！")
+        print(f"视频总数: {len(all_videos)}")
+        print(f"汇总文件: {summary_file}")
+        print(f"输出目录: {self.output_dir.resolve()}")
+        print(f"{'=' * 70}")
+
+    async def get_all_mix_videos(self, mix_id: str) -> List[Dict[str, Any]]:
+        all_videos: List[Dict[str, Any]] = []
+        cursor = 0
+        page = 1
+
+        while True:
+            try:
+                resp = await self.crawler.fetch_user_mix_videos(
+                    mix_id=mix_id, cursor=cursor, count=20
+                )
+                if not resp:
+                    break
+
+                videos = resp.get("aweme_list") or []
+                if not videos:
+                    break
+
+                all_videos.extend(videos)
+                has_more = resp.get("has_more", 0) == 1
+                cursor = resp.get("cursor", 0)
+                print(f"  第 {page} 页: {len(videos)} 个视频，累计: {len(all_videos)}")
+
+                if not has_more:
+                    break
+                page += 1
+                await asyncio.sleep(self.sleep)
+
+            except Exception as e:
+                print(f"  ✗ 获取第 {page} 页失败: {e}")
+                break
+
+        return all_videos
+
+    async def get_all_comments(self, aweme_id: str, video_title: str, expect_count: int):
+        """完整拉取一级评论+部分二级（按 tt.md 要求），受 max_comments 限制"""
+        collected: List[Dict[str, Any]] = []
+        cursor = 0
+
+        while len(collected) < self.max_comments:
+            try:
+                resp = await self.crawler.fetch_video_comments(
+                    aweme_id=aweme_id, cursor=cursor, count=20
+                )
+                if not resp or "comments" not in resp:
+                    break
+                comments = resp.get("comments") or []
+                if not comments:
+                    break
+
+                for c in comments:
+                    collected.append(self.format_comment_row(c, level=1))
+                    # 二级回复（只取必要数量，避免过多请求）
+                    reply_total = c.get("reply_comment_total", 0)
+                    if reply_total > 0 and len(collected) < self.max_comments:
+                        replies = await self.get_comment_replies(
+                            item_id=aweme_id,
+                            comment_id=c.get("cid", ""),
+                            max_needed=self.max_comments - len(collected),
+                        )
+                        collected.extend(replies)
+
+                    if len(collected) >= self.max_comments:
+                        break
+
+                has_more = resp.get("has_more", 0) == 1
+                cursor = resp.get("cursor", 0)
+                if not has_more:
+                    break
+                await asyncio.sleep(0.25)
+
+            except Exception as e:
+                print(f"    ✗ 拉取评论失败: {e}")
+                break
+
+        print(f"    ✓ 获取 {len(collected)} 条评论（预期 {expect_count}）")
+        return collected
+
+    async def get_comment_replies(self, item_id: str, comment_id: str, max_needed: int):
+        """获取二级回复，至多 max_needed"""
+        replies: List[Dict[str, Any]] = []
+        cursor = 0
+        while len(replies) < max_needed:
+            try:
+                resp = await self.crawler.fetch_video_comments_reply(
+                    item_id=item_id, comment_id=comment_id, cursor=cursor, count=20
+                )
+                if not resp or "comments" not in resp:
+                    break
+                data = resp.get("comments") or []
+                if not data:
+                    break
+
+                for r in data:
+                    replies.append(self.format_comment_row(r, level=2, parent_id=comment_id))
+                    if len(replies) >= max_needed:
+                        break
+
+                has_more = resp.get("has_more", 0) == 1
+                cursor = resp.get("cursor", 0)
+                if not has_more:
+                    break
+                await asyncio.sleep(0.2)
+            except Exception:
+                break
+        return replies
+
+    def extract_video_meta(self, idx: int, video: Dict[str, Any]) -> Dict[str, Any]:
+        """提取 tt.md 列表中的核心字段"""
+        statistics = video.get("statistics") or {}
+        author = video.get("author") or {}
+        video_info = video.get("video") or {}
+        text_extra = video.get("text_extra") or []
+        topics = [t.get("hashtag_name") for t in text_extra if t.get("hashtag_name")]
+        mentions = [t.get("user_id") for t in text_extra if t.get("user_id")]
+
+        duration_ms = video_info.get("duration", 0)
+        create_time = datetime.fromtimestamp(video.get("create_time", 0))
+
+        return {
+            "序号": idx,
+            "视频ID": video.get("aweme_id", ""),
+            "视频标题": video.get("desc", ""),
+            "视频描述": video.get("desc", ""),
+            "视频URL": f"https://www.douyin.com/video/{video.get('aweme_id', '')}",
+            "发布时间": create_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "视频时长(s)": round(duration_ms / 1000, 2),
+            "作者昵称": author.get("nickname", ""),
+            "作者ID": author.get("unique_id") or author.get("short_id") or author.get("uid", ""),
+            "话题标签": "|".join(topics) if topics else "",
+            "@用户": "|".join(map(str, mentions)) if mentions else "",
+            "点赞数": statistics.get("digg_count", 0),
+            "收藏数": statistics.get("collect_count", 0),
+            "分享数": statistics.get("share_count", 0),
+            "播放数": statistics.get("play_count", 0),
+            "评论总数": statistics.get("comment_count", 0),
+            # 下面用于与评论合并的占位
+            "层级": "video",
+            "评论ID": "",
+            "父评论ID": "",
+            "评论内容": "",
+            "评论用户": "",
+            "评论点赞": "",
+            "评论时间": "",
+        }
+
+    def format_comment_row(self, comment: Dict[str, Any], level: int, parent_id: str = "") -> Dict[str, Any]:
+        user = comment.get("user") or {}
+        ts = comment.get("create_time", 0)
+        return {
+            "序号": "",
+            "视频ID": comment.get("aweme_id", ""),
+            "视频标题": "",
+            "视频描述": "",
+            "视频URL": "",
+            "发布时间": "",
+            "视频时长(s)": "",
+            "作者昵称": "",
+            "作者ID": "",
+            "话题标签": "",
+            "@用户": "",
+            "点赞数": "",
+            "收藏数": "",
+            "分享数": "",
+            "播放数": "",
+            "评论总数": "",
+            "层级": f"comment{level}",
+            "评论ID": comment.get("cid", ""),
+            "父评论ID": parent_id,
+            "评论内容": comment.get("text", ""),
+            "评论用户": user.get("nickname", ""),
+            "评论点赞": comment.get("digg_count", 0),
+            "评论时间": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "",
+        }
+
+    def merge_video_and_comments(self, video_meta: Dict[str, Any], comments: List[Dict[str, Any]]):
+        """单个视频的 CSV 行：首行是视频元信息，后面跟评论"""
+        rows = [video_meta]
+        for c in comments:
+            # 填充视频ID，便于检索
+            c = {**video_meta, **c} if c.get("层级", "").startswith("comment") else c
+            rows.append(c)
+        return rows
+
+    def save_json(self, filepath: Path, data: List[Dict[str, Any]]):
+        if not data:
+            print(f"  ✗ 无数据，跳过保存 {filepath.name}")
+            return
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"  ✓ 已保存: {filepath.name} ({len(data)} 条)")
+        except Exception as e:
+            print(f"  ✗ 保存失败 {filepath.name}: {e}")
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="抖音合集完整爬虫")
+    parser.add_argument("--mix-id", required=True, help="合集ID，例如 7326746646719498279")
+    parser.add_argument("--no-comments", action="store_true", help="仅爬视频信息，不抓评论")
+    parser.add_argument("--max-comments", type=int, default=1000, help="单视频最多抓取的评论条数")
+    parser.add_argument("--sleep", type=float, default=0.4, help="请求间隔秒，适当放慢防封")
+    parser.add_argument("--out", type=str, default="output", help="输出目录")
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("抖音合集完整爬虫")
+    print("=" * 70)
+    print(f"合集ID: {args.mix_id}")
+    print(f"输出目录: {args.out}")
+    print(f"抓评论: {not args.no_comments}，单视频上限: {args.max_comments}")
+    print(f"请求间隔: {args.sleep}s")
+
+    crawler = MixCrawler(
+        output_dir=Path(args.out),
+        max_comments=args.max_comments,
+        sleep=max(args.sleep, 0.2),
+    )
+    await crawler.crawl_mix_complete(args.mix_id, crawl_comments=not args.no_comments)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n用户中断")
+    except Exception as e:
+        print(f"\n✗ 发生错误: {e}")

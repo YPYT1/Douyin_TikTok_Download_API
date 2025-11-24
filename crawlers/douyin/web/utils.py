@@ -488,10 +488,76 @@ class AwemeIdFetcher:
 
 
 class MixIdFetcher:
-    # 获取方法同AwemeIdFetcher
+    """合集ID提取器"""
+    # 预编译正则表达式
+    _DOUYIN_MIX_URL_PATTERN = re.compile(r"collection/([^/?]*)")
+    
     @classmethod
     async def get_mix_id(cls, url: str) -> str:
-        return
+        """
+        从URL中获取mix_id (Get mix_id from URL)
+        
+        Args:
+            url (str): 输入的url (Input url)
+            
+        Returns:
+            str: 匹配到的mix_id (Matched mix_id)
+        """
+        
+        if not isinstance(url, str):
+            raise TypeError("参数必须是字符串类型")
+        
+        # 重定向到完整链接
+        transport = httpx.AsyncHTTPTransport(retries=5)
+        async with httpx.AsyncClient(
+                transport=transport, proxy=None, timeout=10
+        ) as client:
+            try:
+                response = await client.get(url, follow_redirects=True)
+                response.raise_for_status()
+                
+                response_url = str(response.url)
+                
+                # 尝试匹配合集ID
+                match = cls._DOUYIN_MIX_URL_PATTERN.search(response_url)
+                if match:
+                    return match.group(1)
+                
+                raise APIResponseError("未在响应的地址中找到 mix_id，检查链接是否为合集页")
+                
+            except httpx.RequestError as exc:
+                raise APIConnectionError(
+                    f"请求端点失败，请检查当前网络环境。链接：{url}，代理：{TokenManager.proxies}，异常类名：{cls.__name__}，异常详细信息：{exc}"
+                )
+                
+            except httpx.HTTPStatusError as e:
+                raise APIResponseError(
+                    f"链接：{e.response.url}，状态码 {e.response.status_code}：{e.response.text}"
+                )
+    
+    @classmethod
+    async def get_all_mix_id(cls, urls: list) -> list:
+        """
+        获取合集mix_id列表 (Get mix_id list)
+        
+        Args:
+            urls: list: 列表url (list url)
+            
+        Return:
+            mix_ids: list: 合集的唯一标识，返回列表 (The unique identifier of the mix, return list)
+        """
+        
+        if not isinstance(urls, list):
+            raise TypeError("参数必须是列表类型")
+        
+        # 提取有效URL
+        urls = extract_valid_urls(urls)
+        
+        if urls == []:
+            raise APINotFoundError("输入的URL List不合法。类名：{0}".format(cls.__name__))
+        
+        mix_ids = [cls.get_mix_id(url) for url in urls]
+        return await asyncio.gather(*mix_ids)
 
 
 class WebCastIdFetcher:

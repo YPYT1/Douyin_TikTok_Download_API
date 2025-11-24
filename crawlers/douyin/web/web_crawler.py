@@ -52,6 +52,7 @@ from crawlers.douyin.web.models import (
 # 抖音应用的工具类
 from crawlers.douyin.web.utils import (AwemeIdFetcher,  # Aweme ID获取
                                        BogusManager,  # XBogus管理
+                                       MixIdFetcher,  # 合集ID获取
                                        SecUserIdFetcher,  # 安全用户ID获取
                                        TokenManager,  # 令牌管理
                                        VerifyFpManager,  # 验证管理
@@ -347,6 +348,18 @@ class DouyinWebCrawler:
 
         # 对于URL列表
         return await WebCastIdFetcher.get_all_webcast_id(urls)
+
+    # 提取单个合集id
+    async def get_mix_id(self, url: str):
+        return await MixIdFetcher.get_mix_id(url)
+
+    # 提取列表合集id
+    async def get_all_mix_id(self, urls: list):
+        # 提取有效URL
+        urls = extract_valid_urls(urls)
+
+        # 对于URL列表
+        return await MixIdFetcher.get_all_mix_id(urls)
 
     async def update_cookie(self, cookie: str):
         """
