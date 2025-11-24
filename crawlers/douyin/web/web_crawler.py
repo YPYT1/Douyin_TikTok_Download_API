@@ -228,10 +228,34 @@ class DouyinWebCrawler:
         base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
         async with base_crawler as crawler:
             params = PostComments(aweme_id=aweme_id, cursor=cursor, count=count)
-            endpoint = BogusManager.xb_model_2_endpoint(
-                DouyinAPIEndpoints.POST_COMMENT, params.dict(), kwargs["headers"]["User-Agent"]
-            )
-            response = await crawler.fetch_get_json(endpoint)
+            params_dict = params.dict()
+            # 每次请求动态生成 msToken 与 verifyFp，降低风控命中
+            params_dict["msToken"] = TokenManager.gen_real_msToken()
+            params_dict["verifyFp"] = VerifyFpManager.gen_verify_fp()
+            a_bogus = BogusManager.ab_model_2_endpoint(params_dict, kwargs["headers"]["User-Agent"])
+            endpoint = f"{DouyinAPIEndpoints.POST_COMMENT}?{urlencode(params_dict)}&a_bogus={a_bogus}"
+
+            response = None
+            try:
+                a_bogus = BogusManager.ab_model_2_endpoint(params_dict, kwargs["headers"]["User-Agent"])
+                endpoint_a_bogus = f"{DouyinAPIEndpoints.POST_COMMENT}?{urlencode(params_dict)}&a_bogus={a_bogus}"
+                response = await crawler.fetch_get_json(endpoint_a_bogus)
+            except Exception as e:
+                print(f"WARNING: a_bogus request failed: {e}")
+
+            if response is None:
+                # 回退至 X-Bogus（少数场景 ab 失败）
+                print("WARNING: a_bogus response was None, falling back to X-Bogus.")
+                try:
+                    endpoint_x_bogus = BogusManager.xb_model_2_endpoint(
+                        DouyinAPIEndpoints.POST_COMMENT, params.dict(), kwargs["headers"]["User-Agent"]
+                    )
+                    response = await crawler.fetch_get_json(endpoint_x_bogus)
+                except Exception as e:
+                    print(f"WARNING: X-Bogus request failed: {e}")
+
+            if response is None:
+                raise ValueError("Failed to fetch video comments: both a_bogus and X-Bogus attempts returned None.")
         return response
 
     # 获取指定视频的评论回复数据
@@ -240,10 +264,19 @@ class DouyinWebCrawler:
         base_crawler = BaseCrawler(proxies=kwargs["proxies"], crawler_headers=kwargs["headers"])
         async with base_crawler as crawler:
             params = PostCommentsReply(item_id=item_id, comment_id=comment_id, cursor=cursor, count=count)
-            endpoint = BogusManager.xb_model_2_endpoint(
-                DouyinAPIEndpoints.POST_COMMENT_REPLY, params.dict(), kwargs["headers"]["User-Agent"]
-            )
-            response = await crawler.fetch_get_json(endpoint)
+            params_dict = params.dict()
+            params_dict["msToken"] = TokenManager.gen_real_msToken()
+            params_dict["verifyFp"] = VerifyFpManager.gen_verify_fp()
+            a_bogus = BogusManager.ab_model_2_endpoint(params_dict, kwargs["headers"]["User-Agent"])
+            endpoint = f"{DouyinAPIEndpoints.POST_COMMENT_REPLY}?{urlencode(params_dict)}&a_bogus={a_bogus}"
+
+            try:
+                response = await crawler.fetch_get_json(endpoint)
+            except Exception:
+                endpoint = BogusManager.xb_model_2_endpoint(
+                    DouyinAPIEndpoints.POST_COMMENT_REPLY, params.dict(), kwargs["headers"]["User-Agent"]
+                )
+                response = await crawler.fetch_get_json(endpoint)
         return response
 
     # 获取抖音热榜数据

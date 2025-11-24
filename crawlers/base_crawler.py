@@ -196,7 +196,10 @@ class BaseCrawler:
                             "获取端点数据失败, 次数达到上限"
                         )
 
-                    await asyncio.sleep(self._timeout)
+                    try:
+                        await asyncio.sleep(self._timeout)
+                    except asyncio.CancelledError:
+                        raise
                     continue
 
                 # logger.info("响应状态码: {0}".format(response.status_code))
@@ -245,7 +248,10 @@ class BaseCrawler:
                             "获取端点数据失败, 次数达到上限"
                         )
 
-                    await asyncio.sleep(self._timeout)
+                    try:
+                        await asyncio.sleep(self._timeout)
+                    except asyncio.CancelledError:
+                        raise
                     continue
 
                 # logger.info("响应状态码: {0}".format(response.status_code))

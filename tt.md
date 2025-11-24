@@ -95,3 +95,15 @@
 2. **关键词提取**：使用jieba或其他分词工具提取关键词（可以使用更高级的内容）
 3. **数据存储**：将数据保存到CS文件
 4. **数据分析**：统计高频词、高赞内容等完整的数据分析，（暂时不用实现）
+
+
+这些是我找到的一级评论:
+/html/body/div[2]/div[1]/div[4]/div[3]/div/div[3]/div[1]/div[1]/div/div[32]/div/div[2]/div/div/div[3]/div/div/div[3]/div[1]/div/div[2]/div/div[2]/span/span/span/span/span/span/span
+/html/body/div[2]/div[1]/div[4]/div[3]/div/div[3]/div[1]/div[1]/div/div[32]/div/div[2]/div/div/div[3]/div/div/div[3]/div[4]/div/div[2]/div/div[2]/span/span/span/span/span/span/span
+/html/body/div[2]/div[1]/div[4]/div[3]/div/div[3]/div[1]/div[1]/div/div[32]/div/div[2]/div/div/div[3]/div/div/div[3]/div[18]/div/div[2]/div/div[2]/span/span/span/span/span/span/span
+/html/body/div[2]/div[1]/div[4]/div[3]/div/div[3]/div[1]/div[1]/div/div[32]/div/div[2]/div/div/div[3]/div/div/div[3]/div[18]/div/div[2]/div/div[2]/span/span/span/span/span/span/span
+/html/body/div[2]/div[1]/div[4]/div[3]/div/div[3]/div[1]/div[1]/div/div[32]/div/div[2]/div/div/div[3]/div/div/div[3]/div[22]/div/div[2]/div/div[2]/span/span/span/span/span/span/span
+/html/body/div[2]/div[1]/div[4]/div[3]/div/div[3]/div[1]/div[1]/div/div[32]/div/div[2]/div/div/div[3]/div/div/div[3]/div[26]/div/div[2]/div/div[2]/span/span/span/span/span/span/span
+这些是我找到的二级评论:
+/html/body/div[2]/div[1]/div[4]/div[3]/div/div[3]/div[1]/div[1]/div/div[32]/div/div[2]/div/div/div[3]/div/div/div[3]/div[17]/div/div[2]/div[2]/div[1]/div[2]/div/div[2]/span/span/span/span/span/span/span
+/html/body/div[2]/div[1]/div[4]/div[3]/div/div[3]/div[1]/div[1]/div/div[32]/div/div[2]/div/div/div[3]/div/div/div[3]/div[17]/div/div[2]/div[2]/div[1]/div[2]/div/div[2]/span/span/span/span/span/span/span

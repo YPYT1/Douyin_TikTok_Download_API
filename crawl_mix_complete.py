@@ -4,12 +4,11 @@
 output/
  ├─001/【视频标题】.csv   （含视频元信息 + 一级/二级评论）
  ├─002/...
-同时在 output/mix_summary_*.csv 写全集合汇总。
 """
 
 import argparse
 import asyncio
-import json
+import csv
 import sys
 import time
 from datetime import datetime
@@ -35,7 +34,7 @@ def sanitize_filename(name: str, max_len: int = 80) -> str:
 
 
 class MixCrawler:
-    """合集爬虫（顺序爬取，带断点跳过已存在文件）"""
+    """合集爬虫（逐个视频爬取并立即保存为CSV）"""
 
     def __init__(self, output_dir: Path, max_comments: int, sleep: float):
         self.crawler = DouyinWebCrawler()
@@ -44,91 +43,110 @@ class MixCrawler:
         self.max_comments = max_comments
         self.sleep = sleep
 
+    async def verify_cookie(self) -> bool:
+        """验证Cookie是否有效，通过请求用户信息接口测试"""
+        print("\n【Cookie验证】正在检查Cookie有效性...")
+        try:
+            # 尝试获取热搜（无需登录的公开接口）
+            resp = await self.crawler.fetch_hot_search_result()
+            if resp and "data" in resp:
+                print("✓ Cookie基础验证通过（能访问公开接口）")
+                
+                # 进一步验证评论接口（随机测试视频）
+                print("✓ 正在测试评论接口...")
+                test_aweme_id = "7320576816895348005"  # 测试视频ID
+                comment_resp = await self.crawler.fetch_video_comments(
+                    aweme_id=test_aweme_id, cursor=0, count=1
+                )
+                
+                if comment_resp is not None:
+                    # 检查是否有comments字段，或者是否有错误信息
+                    if "comments" in comment_resp or comment_resp.get("status_code") == 0:
+                        print("✓ Cookie完全验证通过！可以正常获取评论\n")
+                        return True
+                    elif "status_code" in comment_resp:
+                        status_code = comment_resp.get("status_code")
+                        status_msg = comment_resp.get("status_msg", "未知错误")
+                        print(f"\n✗ 评论接口返回错误:")
+                        print(f"  状态码: {status_code}")
+                        print(f"  错误信息: {status_msg}")
+                        if status_code == 2053:
+                            print("  \n原因: Cookie已过期或需要重新登录")
+                        elif status_code == 8:
+                            print("  \n原因: 请求频率过快，被限流")
+                        return False
+                    else:
+                        print("\n✗ 评论接口返回空内容，可能原因：")
+                        print("  1. Cookie 已过期或不完整")
+                        print("  2. 被风控系统拦截")
+                        print("  3. msToken/verifyFp 等参数失效")
+                        return False
+                else:
+                    print("\n✗ 评论接口返回 None")
+                    return False
+            else:
+                print("\n✗ Cookie验证失败：无法访问基础接口")
+                return False
+                
+        except Exception as e:
+            print(f"\n✗ Cookie验证异常: {e}")
+            return False
+
     async def crawl_mix_complete(self, mix_id: str, crawl_comments: bool = True):
         print(f"\n{'=' * 70}")
         print(f"开始爬取合集: {mix_id}")
-        print(f"{'=' * 70}")
+        print(f"{'=' * 70}\n")
 
-        # 1) 拉全集合视频
-        print("\n【步骤1】获取合集所有视频...")
-        all_videos = await self.get_all_mix_videos(mix_id)
-        if not all_videos:
-            print("✗ 未获取到视频，可能 Cookie 失效或接口变更")
+        # 先验证Cookie
+        if not await self.verify_cookie():
+            print("\n" + "=" * 70)
+            print("⚠️  Cookie验证失败，请更新Cookie后重试！")
+            print("=" * 70)
+            print("\n更新Cookie步骤：")
+            print("1. 打开浏览器访问 https://www.douyin.com 并登录")
+            print("2. F12 打开开发者工具 → Network(网络)选项卡")
+            print("3. 随便打开一个视频的评论区")
+            print("4. 找到 'comment/list' 请求，点击查看 Request Headers")
+            print("5. 复制完整的 Cookie 值")
+            print("6. 替换到 crawlers/douyin/web/config.yaml 的 Cookie 字段")
+            print("7. 保存文件并重新运行\n")
             return
-        print(f"✓ 共获取 {len(all_videos)} 个视频")
 
-        # 2) 汇总 CSV
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        summary_file = self.output_dir / f"mix_{mix_id}_summary_{timestamp}.json"
-        summary_rows: List[Dict[str, Any]] = []
-
-        print("\n【步骤2】逐条落盘（含评论）...")
-        for idx, video in enumerate(all_videos, 1):
-            folder = self.output_dir / f"{idx:03d}"
-            folder.mkdir(exist_ok=True)
-
-            video_meta = self.extract_video_meta(idx, video)
-            file_name = sanitize_filename(video_meta["视频标题"]) + ".json"
-            file_path = folder / file_name
-
-            if file_path.exists():
-                print(f"  {idx:03d}/{len(all_videos)} 已存在，跳过：{file_name}")
-                summary_rows.append(video_meta)
-                continue
-
-            # 评论（可选）
-            comments: List[Dict[str, Any]] = []
-            if crawl_comments and video_meta["评论总数"] > 0:
-                comments = await self.get_all_comments(
-                    aweme_id=video_meta["视频ID"],
-                    video_title=video_meta["视频标题"],
-                    expect_count=video_meta["评论总数"],
-                )
-
-            rows = self.merge_video_and_comments(video_meta, comments)
-            self.save_json(file_path, rows)
-            summary_rows.append(video_meta)
-
-            try:
-                rel_path = file_path.relative_to(self.output_dir)
-            except Exception:
-                rel_path = file_path.name
-            print(f"  ✓ 已完成 {idx:03d}/{len(all_videos)} -> {rel_path}")
-            await asyncio.sleep(self.sleep)
-
-        # 写汇总
-        self.save_json(summary_file, summary_rows)
-        print(f"\n{'=' * 70}")
-        print("爬取完成！")
-        print(f"视频总数: {len(all_videos)}")
-        print(f"汇总文件: {summary_file}")
-        print(f"输出目录: {self.output_dir.resolve()}")
-        print(f"{'=' * 70}")
-
-    async def get_all_mix_videos(self, mix_id: str) -> List[Dict[str, Any]]:
-        all_videos: List[Dict[str, Any]] = []
         cursor = 0
         page = 1
+        total_videos = 0
 
         while True:
             try:
+                print(f"【获取第 {page} 页视频】")
                 resp = await self.crawler.fetch_user_mix_videos(
                     mix_id=mix_id, cursor=cursor, count=20
                 )
                 if not resp:
+                    print("✗ 未获取到视频，可能 Cookie 失效或接口变更")
                     break
 
                 videos = resp.get("aweme_list") or []
                 if not videos:
+                    print("✓ 没有更多视频")
                     break
 
-                all_videos.extend(videos)
+                print(f"  获取到 {len(videos)} 个视频\n")
+
+                for video in videos:
+                    total_videos += 1
+                    await self.process_single_video(
+                        video=video,
+                        video_index=total_videos,
+                        crawl_comments=crawl_comments,
+                    )
+                    await asyncio.sleep(self.sleep)
+
                 has_more = resp.get("has_more", 0) == 1
                 cursor = resp.get("cursor", 0)
-                print(f"  第 {page} 页: {len(videos)} 个视频，累计: {len(all_videos)}")
-
                 if not has_more:
                     break
+
                 page += 1
                 await asyncio.sleep(self.sleep)
 
@@ -136,7 +154,51 @@ class MixCrawler:
                 print(f"  ✗ 获取第 {page} 页失败: {e}")
                 break
 
-        return all_videos
+        print(f"\n{'=' * 70}")
+        print("爬取完成！")
+        print(f"已处理视频总数: {total_videos}")
+        print(f"输出目录: {self.output_dir.resolve()}")
+        print(f"{'=' * 70}")
+
+    async def process_single_video(self, video: Dict[str, Any], video_index: int, crawl_comments: bool):
+        """处理单个视频：获取评论并立即保存为CSV"""
+        folder = self.output_dir / f"{video_index:03d}"
+        folder.mkdir(exist_ok=True)
+
+        video_meta = self.extract_video_meta(video_index, video)
+        file_name = sanitize_filename(f"{video_meta['视频标题']}_{video_meta['视频ID']}") + ".csv"
+        file_path = folder / file_name
+
+        if file_path.exists():
+            print(f"  {video_index:03d} 已存在，跳过：{file_name}")
+            return
+
+        print(f"【处理视频 {video_index:03d}】{video_meta['视频标题'][:50]}...")
+
+        comments: List[Dict[str, Any]] = []
+        if crawl_comments and video_meta["评论总数"] > 0:
+            try:
+                comments = await self.get_all_comments(
+                    aweme_id=video_meta["视频ID"],
+                    video_title=video_meta["视频标题"],
+                    expect_count=video_meta["评论总数"],
+                )
+            except Exception as e:
+                print(f"    ✗ 拉取评论失败(已跳过): {e}")
+                comments = []
+            except BaseException as e:
+                print(f"    ✗ 拉取评论被中断(已跳过): {e}")
+                comments = []
+
+        rows = self.merge_video_and_comments(video_meta, comments)
+        self.save_csv(file_path, rows)
+
+        try:
+            rel_path = file_path.relative_to(self.output_dir)
+        except Exception:
+            rel_path = file_path.name
+        print(f"  ✓ 已保存: {rel_path}\n")
+
 
     async def get_all_comments(self, aweme_id: str, video_title: str, expect_count: int):
         """完整拉取一级评论+部分二级（按 tt.md 要求），受 max_comments 限制"""
@@ -288,13 +350,23 @@ class MixCrawler:
             rows.append(c)
         return rows
 
-    def save_json(self, filepath: Path, data: List[Dict[str, Any]]):
+    def save_csv(self, filepath: Path, data: List[Dict[str, Any]]):
+        """保存为 CSV 格式（固定列顺序，兼容 tt.md）"""
         if not data:
             print(f"  ✗ 无数据，跳过保存 {filepath.name}")
             return
         try:
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            fieldnames = [
+                "序号", "视频ID", "视频标题", "视频描述", "视频URL", "发布时间", "视频时长(s)",
+                "作者昵称", "作者ID", "话题标签", "@用户",
+                "点赞数", "收藏数", "分享数", "播放数", "评论总数",
+                "层级", "评论ID", "父评论ID", "评论内容", "评论用户", "评论点赞", "评论时间"
+            ]
+            with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in data:
+                    writer.writerow({k: row.get(k, "") for k in fieldnames})
             print(f"  ✓ 已保存: {filepath.name} ({len(data)} 条)")
         except Exception as e:
             print(f"  ✗ 保存失败 {filepath.name}: {e}")
