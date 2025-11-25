@@ -79,7 +79,7 @@ class TokenManager:
     douyin_manager = config.get("TokenManager").get("douyin")
     token_conf = douyin_manager.get("msToken", None)
     ttwid_conf = douyin_manager.get("ttwid", None)
-    proxies_conf = douyin_manager.get("proxies", None)
+    proxies_conf = douyin_manager.get("proxies", {})
     proxies = {
         "http://": proxies_conf.get("http", None),
         "https://": proxies_conf.get("https", None),
