@@ -101,7 +101,10 @@ class DrissionMixCrawler:
             return False
     
     def _check_captcha(self) -> bool:
-        """检查是否出现验证码弹窗 - 优化版，减少误报"""
+        """检查是否出现验证码弹窗 - 优化版，减少误报
+        
+        改进: 检测元素是否可见，避免验证完成后元素残留导致误判
+        """
         try:
             # 只检测特定的验证码弹窗元素，不搜索整个页面文本（避免误报）
             # 抖音验证码通常是一个模态弹窗
@@ -117,7 +120,63 @@ class DrissionMixCrawler:
             for selector in captcha_selectors:
                 ele = self.driver.ele(selector, timeout=0.3)
                 if ele:
-                    return True
+                    # 【关键修复】检查元素是否真正可见
+                    try:
+                        # 方法1: 检查元素的显示状态
+                        style = ele.attr('style') or ''
+                        # 如果 style 中有 display:none 或 visibility:hidden，则不可见
+                        if 'display: none' in style or 'display:none' in style:
+                            continue
+                        if 'visibility: hidden' in style or 'visibility:hidden' in style:
+                            continue
+                        
+                        # 方法2: 检查元素尺寸（不可见元素通常尺寸为0）
+                        rect = ele.rect
+                        if rect:
+                            width = rect.get('width', 0) or 0
+                            height = rect.get('height', 0) or 0
+                            if width < 10 or height < 10:
+                                continue  # 尺寸太小，可能是隐藏的
+                        
+                        # 方法3: 检查 class 是否包含隐藏标识
+                        class_attr = ele.attr('class') or ''
+                        if 'hidden' in class_attr.lower() or 'hide' in class_attr.lower():
+                            continue
+                        
+                        # 方法4: 尝试用 JS 检查是否可见
+                        try:
+                            is_visible = self.driver.run_js('''
+                                function isVisible(el) {
+                                    if (!el) return false;
+                                    var style = window.getComputedStyle(el);
+                                    if (style.display === 'none') return false;
+                                    if (style.visibility === 'hidden') return false;
+                                    if (style.opacity === '0') return false;
+                                    var rect = el.getBoundingClientRect();
+                                    if (rect.width < 10 || rect.height < 10) return false;
+                                    return true;
+                                }
+                                return isVisible(arguments[0]);
+                            ''', ele)
+                            if not is_visible:
+                                continue
+                        except:
+                            pass  # JS检查失败时继续使用其他判断
+                        
+                        # 通过所有检查，确认验证码可见
+                        return True
+                        
+                    except Exception:
+                        # 如果检查可见性失败，为安全起见认为验证码存在
+                        # 但增加一个额外确认：检查页面是否有明确的验证码文字
+                        try:
+                            page_html = self.driver.html or ''
+                            # 只有当页面中确实有验证码相关的提示文字时才认为有验证码
+                            if '请完成验证' in page_html or '滑动滑块' in page_html or '点击验证' in page_html:
+                                return True
+                        except:
+                            pass
+                        continue
             
             # 检查标题是否包含验证码关键词（这个比较可靠）
             title = self.driver.title or ""
@@ -949,6 +1008,18 @@ class DrissionMixCrawler:
                         
                         last_log_time = current_time
                         last_log_count = len(comments)
+                        
+                        # 【优化】小评论量视频：预期<150条且覆盖率>92%时提前结束
+                        if expected_count < 150 and coverage >= 92:
+                            print()
+                            log(f"    小评论量视频(预期{expected_count}条)，覆盖率{coverage:.1f}%已足够，提前结束", "SUCCESS")
+                            break
+                        
+                        # 【优化】中等评论量视频：预期<800条且覆盖率>95%时提前结束
+                        if expected_count < 800 and coverage >= 95:
+                            print()
+                            log(f"    中等评论量视频(预期{expected_count}条)，覆盖率{coverage:.1f}%已足够，提前结束", "SUCCESS")
+                            break
                         
                         # 【优化】覆盖率达到100%时验证并提前结束
                         if coverage >= 100:
