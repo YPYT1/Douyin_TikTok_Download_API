@@ -1,5 +1,5 @@
 # DrissionPage 抖音合集爬虫使用说明
-python crawl_mix_drission.py --mix-id 7326746646719498279 --start 3 --login-wait 60
+uv python crawl_mix_drission.py --mix-id 7326746646719498279 --start 3 --login-wait 60
 ## 简介
 
 `crawl_mix_drission.py` 是一个基于 DrissionPage 的抖音合集视频爬虫，使用浏览器网络监听方式获取评论数据。

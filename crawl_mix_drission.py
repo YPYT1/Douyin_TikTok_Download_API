@@ -139,6 +139,76 @@ class DrissionMixCrawler:
         input()
         log("继续执行...", "INFO")
     
+    def _check_video_exists(self) -> bool:
+        """检查视频是否存在，返回 True 表示视频有效"""
+        try:
+            # 检查页面标题
+            title = self.driver.title or ""
+            
+            # 首先检查是否是正常的视频页面（抖音视频页标题通常包含作者名或视频标题）
+            # 如果标题包含明确的错误信息，则视频不存在
+            if '不存在' in title or '已删除' in title or '404' in title or '错误' in title:
+                return False
+            
+            # 检查 URL 是否被重定向到错误页面
+            current_url = self.driver.url or ""
+            if '/error' in current_url or '/404' in current_url:
+                return False
+            
+            # 检查页面可见文本中是否有明确的"不存在"提示
+            # 注意：只检查特定的错误提示元素，避免误判
+            error_texts = [
+                '作品不存在',
+                '视频不存在', 
+                '内容不存在',
+                '该视频已删除',
+                '该作品已删除',
+                '页面不存在',
+                '抱歉，页面未找到',
+            ]
+            
+            # 使用元素选择器检查错误提示（更精确）
+            error_selectors = [
+                'xpath://div[contains(@class, "error")]//span',
+                'xpath://div[contains(@class, "empty")]//p',
+                'xpath://div[contains(@class, "videoNotFound")]',
+                'xpath://div[contains(@class, "notFound")]',
+            ]
+            
+            for selector in error_selectors:
+                try:
+                    ele = self.driver.ele(selector, timeout=0.5)
+                    if ele:
+                        ele_text = ele.text or ""
+                        for error_text in error_texts:
+                            if error_text in ele_text:
+                                return False
+                except:
+                    pass
+            
+            # 检查是否有视频播放器元素（视频存在的正面证据）
+            video_selectors = [
+                'xpath://video',
+                'xpath://div[contains(@class, "xgplayer")]',
+                'xpath://div[contains(@class, "video-player")]',
+            ]
+            
+            for selector in video_selectors:
+                try:
+                    ele = self.driver.ele(selector, timeout=0.5)
+                    if ele:
+                        return True  # 找到视频播放器，视频存在
+                except:
+                    pass
+            
+            # 如果没有明确的错误提示，也没有找到视频播放器，可能还在加载中
+            # 默认返回 True，让后续逻辑继续处理
+            return True
+            
+        except Exception as e:
+            # 检测出错时默认视频存在，继续尝试
+            return True
+    
     def load_cookies(self) -> Optional[List[Tuple[str, str]]]:
         """从 config.yaml 加载 Cookie - 支持多路径查找"""
         log("加载 Cookie...", "INFO")
@@ -551,8 +621,13 @@ class DrissionMixCrawler:
         
         return videos
     
-    def get_video_comments(self, aweme_id: str, expected_count: int = 0) -> List[Dict]:
-        """获取视频评论 - 使用网络监听方式"""
+    def get_video_comments(self, aweme_id: str, expected_count: int = 0) -> Optional[List[Dict]]:
+        """获取视频评论 - 使用网络监听方式
+        
+        Returns:
+            List[Dict]: 评论列表
+            None: 视频不存在或已删除
+        """
         comments = []
         comment_ids = set()
         
@@ -579,6 +654,28 @@ class DrissionMixCrawler:
             # 检查验证码
             if self._check_captcha():
                 self._handle_captcha()
+            
+            # 检查视频是否存在（添加诊断信息）
+            if not self._check_video_exists():
+                log(f"  ⚠️ 页面显示视频不存在！", "WARNING")
+                log(f"  当前URL: {self.driver.url}", "DEBUG")
+                log(f"  页面标题: {self.driver.title}", "DEBUG")
+                # 截图保存诊断
+                try:
+                    screenshot_path = self.output_dir / f"debug_video_not_exist_{aweme_id}.png"
+                    self.driver.get_screenshot(path=str(screenshot_path))
+                    log(f"  已保存截图: {screenshot_path}", "DEBUG")
+                except:
+                    pass
+                # 尝试刷新页面重试一次
+                log(f"  尝试刷新页面重试...", "WARNING")
+                self.driver.refresh()
+                time.sleep(5)
+                if not self._check_video_exists():
+                    log(f"  刷新后仍然显示不存在，可能是视频被删除或地域限制", "ERROR")
+                    return None
+                else:
+                    log(f"  刷新后页面正常，继续处理", "SUCCESS")
             
             # 等待评论区加载
             log(f"  等待评论区加载...", "DEBUG")
@@ -1045,85 +1142,115 @@ class DrissionMixCrawler:
             pass
     
     def get_video_comments_api(self, aweme_id: str, expected_count: int = 0) -> List[Dict]:
-        """使用 API 获取视频一级评论（适用于大量评论的视频，速度快）"""
+        """使用 API 获取视频一级评论（适用于大量评论的视频，速度快，无需浏览器滚动）"""
         import asyncio
         
         comments = []
         comment_ids = set()
         
-        log(f"  使用 API 获取一级评论...", "DEBUG")
+        log(f"  使用 API 模式获取一级评论（无需滚动）...", "INFO")
         
         try:
             # 导入 API 爬虫
             from crawlers.douyin.web.web_crawler import DouyinWebCrawler
             
             async def fetch_comments():
-                async with DouyinWebCrawler() as crawler:
-                    cursor = 0
-                    page = 0
-                    max_pages = 200  # 最多200页
+                crawler = DouyinWebCrawler()
+                cursor = 0
+                page = 0
+                max_pages = 200  # 最多200页
+                
+                while page < max_pages and len(comments) < self.max_comments:
+                    page += 1
                     
-                    while page < max_pages and len(comments) < self.max_comments:
-                        page += 1
+                    try:
+                        result = await crawler.fetch_video_comments(
+                            aweme_id=aweme_id,
+                            cursor=cursor,
+                            count=50  # 每页50条
+                        )
                         
-                        try:
-                            result = await crawler.fetch_video_comments(
-                                aweme_id=aweme_id,
-                                cursor=cursor,
-                                count=50  # 每页50条
-                            )
-                            
-                            if not result:
-                                log(f"    API 第 {page} 页返回空", "WARNING")
-                                break
-                            
-                            comments_data = result.get('comments', [])
-                            if not comments_data:
-                                log(f"    API 第 {page} 页无评论数据", "DEBUG")
-                                break
-                            
-                            for comment in comments_data:
-                                comment_id = comment.get('cid', '')
-                                if comment_id and comment_id not in comment_ids:
-                                    comment_ids.add(comment_id)
-                                    parsed = self._parse_comment(comment)
-                                    parsed['level'] = 1  # API 获取的都是一级评论
-                                    comments.append(parsed)
-                            
-                            # 检查是否还有更多
-                            has_more = result.get('has_more', 0)
-                            new_cursor = result.get('cursor', 0)
-                            
-                            # 实时显示进度
-                            coverage = (len(comments) / expected_count * 100) if expected_count > 0 else 0
-                            print(f"\r    📊 API 第 {page} 页 | 已获取 {len(comments):,} 条一级评论 | 覆盖率 {coverage:.1f}%    ", end='', flush=True)
-                            
-                            if not has_more or new_cursor == cursor:
-                                print()  # 换行
-                                log(f"    API 获取完成，共 {page} 页，{len(comments)} 条评论", "DEBUG")
-                                break
-                            
-                            cursor = new_cursor
-                            await asyncio.sleep(0.3)  # API 间隔
-                            
-                        except Exception as e:
-                            log(f"    API 第 {page} 页异常: {e}", "WARNING")
+                        if not result:
+                            log(f"    API 第 {page} 页返回空", "WARNING")
                             break
+                        
+                        comments_data = result.get('comments', [])
+                        if not comments_data:
+                            log(f"    API 第 {page} 页无评论数据", "DEBUG")
+                            break
+                        
+                        for comment in comments_data:
+                            comment_id = comment.get('cid', '')
+                            if comment_id and comment_id not in comment_ids:
+                                comment_ids.add(comment_id)
+                                parsed = self._parse_comment(comment)
+                                parsed['level'] = 1  # API 获取的都是一级评论
+                                comments.append(parsed)
+                        
+                        # 检查是否还有更多
+                        has_more = result.get('has_more', 0)
+                        new_cursor = result.get('cursor', 0)
+                        
+                        # 实时显示进度
+                        coverage = (len(comments) / expected_count * 100) if expected_count > 0 else 0
+                        print(f"\r    📊 API 第 {page} 页 | 已获取 {len(comments):,} 条一级评论 | 覆盖率 {coverage:.1f}%    ", end='', flush=True)
+                        
+                        if not has_more or new_cursor == cursor:
+                            print()  # 换行
+                            log(f"    API 获取完成，共 {page} 页，{len(comments)} 条评论", "SUCCESS")
+                            break
+                        
+                        cursor = new_cursor
+                        await asyncio.sleep(0.3)  # API 间隔
+                        
+                    except Exception as e:
+                        log(f"    API 第 {page} 页异常: {e}", "WARNING")
+                        break
             
             # 运行异步任务
             asyncio.run(fetch_comments())
             
-        except ImportError:
-            log("  无法导入 API 模块，回退到浏览器模式", "WARNING")
-            return self.get_video_comments(aweme_id, expected_count)
+            if len(comments) > 0:
+                log(f"  API 模式成功获取 {len(comments)} 条评论", "SUCCESS")
+            else:
+                log(f"  API 模式未获取到评论", "WARNING")
+            
+        except ImportError as e:
+            log(f"  无法导入 API 模块: {e}，跳过该视频评论获取", "ERROR")
         except Exception as e:
-            log(f"  API 获取异常: {e}，回退到浏览器模式", "WARNING")
-            return self.get_video_comments(aweme_id, expected_count)
+            log(f"  API 获取异常: {e}，跳过该视频评论获取", "ERROR")
         
         return comments
     
+    def _reset_browser_state(self):
+        """重置浏览器状态，用于视频间切换"""
+        try:
+            # 停止所有监听器
+            try:
+                self.driver.listen.stop()
+            except:
+                pass
+            
+            # 清除监听器缓存
+            try:
+                self.driver.listen.clear()
+            except:
+                pass
+            
+            # 滚动到页面顶部
+            try:
+                self.driver.run_js('window.scrollTo(0, 0)')
+            except:
+                pass
+                
+        except Exception as e:
+            pass  # 忽略重置过程中的错误
+    
     def process_video(self, video: Dict, crawl_comments: bool = True):
         """处理单个视频"""
+        # 【关键】在处理新视频前重置浏览器状态
+        self._reset_browser_state()
+        
         idx = video['index']
         aweme_id = video['aweme_id']
         # 【修复】显示原始合集总数，而不是当前批次总数
@@ -1164,6 +1291,8 @@ class DrissionMixCrawler:
         # 【优化】评论数 > 1500 时用 API 只抓一级评论（更快），否则用浏览器滚动抓全部
         LARGE_COMMENT_THRESHOLD = 1500
         
+        video_not_exist = False
+        
         if crawl_comments and total_expected > 0:
             if total_expected > LARGE_COMMENT_THRESHOLD:
                 log(f"  评论数 {total_expected} > {LARGE_COMMENT_THRESHOLD}，使用 API 快速模式（只抓一级评论）", "INFO")
@@ -1171,19 +1300,31 @@ class DrissionMixCrawler:
             else:
                 comments = self.get_video_comments(aweme_id, total_expected)
             
-            actual_count = len(comments)
-            coverage = (actual_count / total_expected * 100) if total_expected > 0 else 0
-            level1 = sum(1 for c in comments if c.get('level', 1) == 1)
-            level2 = actual_count - level1
-            
-            self.stats['total_comments'] += actual_count
-            
-            if coverage >= 80:
-                log(f"评论获取完成: {actual_count}/{total_expected} 条 (覆盖率 {coverage:.1f}%)", "SUCCESS")
+            # 检查视频是否存在 (get_video_comments 返回 None 表示视频不存在)
+            if comments is None:
+                video_not_exist = True
+                comments = []
+                log(f"视频不存在或已删除，跳过此视频", "WARNING")
             else:
-                log(f"评论获取完成: {actual_count}/{total_expected} 条 (覆盖率 {coverage:.1f}%)", "WARNING")
-            
-            log(f"  一级评论: {level1} 条 | 二级评论: {level2} 条", "INFO")
+                actual_count = len(comments)
+                coverage = (actual_count / total_expected * 100) if total_expected > 0 else 0
+                level1 = sum(1 for c in comments if c.get('level', 1) == 1)
+                level2 = actual_count - level1
+                
+                self.stats['total_comments'] += actual_count
+                
+                if coverage >= 80:
+                    log(f"评论获取完成: {actual_count}/{total_expected} 条 (覆盖率 {coverage:.1f}%)", "SUCCESS")
+                else:
+                    log(f"评论获取完成: {actual_count}/{total_expected} 条 (覆盖率 {coverage:.1f}%)", "WARNING")
+                
+                log(f"  一级评论: {level1} 条 | 二级评论: {level2} 条", "INFO")
+        
+        # 如果视频不存在，跳过保存
+        if video_not_exist:
+            self.stats['processed_videos'] += 1
+            self.stats['failed_videos'] += 1
+            return
         
         # 保存CSV
         file_name = sanitize_filename(f"{video['title']}_{aweme_id}") + ".csv"
